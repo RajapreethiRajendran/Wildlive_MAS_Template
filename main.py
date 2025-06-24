@@ -40,7 +40,7 @@ def build_wlmo_fragment_selector(annotation: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "@type": "wlmo:FragmentSelector",
         "wlmo:value": f"xywh={x},{y},{w},{h}",
-        "wlmo:conformsTo": "http://www.w3.org/TR/media-frags/"
+        "wlmo:conformsTo": "https://wildlive.senckenberg.de/wlmo/0.3/"
     }
 
 def run_wildlive_detection(image_uri: str) -> Tuple[List[Dict[str, Any]], int, int]:
@@ -85,7 +85,7 @@ def map_result_to_wlmo_annotation(
 
         annotation = {
             "@context": {
-                "wlmo": "https://w3id.org/wlmo#"
+                "wlmo": "https://wildlive.senckenberg.de/wlmo/0.3/"
             },
             "@type": "wlmo:Annotation",
             "wlmo:creator": agent,
@@ -98,7 +98,7 @@ def map_result_to_wlmo_annotation(
             },
             "wlmo:hasBody": body,
             "wlmo:generator": {
-                "@id": "https://wildlive.senckenberg.de/wlmo/current/",
+                "@id": "https://wildlive.senckenberg.de/wlmo/0.3/",
                 "@type": "wlmo:Software",
                 "wlmo:name": "WildLive Detection Service"
             }
