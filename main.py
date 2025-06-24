@@ -2,194 +2,150 @@ import json
 import logging
 import os
 import uuid
-
-import pika
-import requests as requests
 from typing import Dict, Any, List, Tuple
-from pika.amqp_object import Method, Properties
-from pika.adapters.blocking_connection import BlockingChannel
 
-import shared
+import requests
+from celery import Celery
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 
+# Initialize Celery app with broker and backend from environment variables or defaults
+celery = Celery(
+    "annotation_worker",
+    broker=os.environ.get("CELERY_BROKER_URL", "pyamqp://guest@localhost//"),
+    backend=os.environ.get("CELERY_RESULT_BACKEND", "rpc://"),
+)
+celery.conf.task_routes = {
+    "process_annotation_job": {"queue": os.environ.get("CELERY_QUEUE", "annotation")}
+}
 
-def run_rabbitmq() -> None:
-    """
-    Start a RabbitMQ consumer and process the messages by unpacking the image.
-    When done, it will publish an annotation to annotation processing service
-    """
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(
-            os.environ.get("RABBITMQ_HOST"),
-            credentials=pika.PlainCredentials(os.environ.get("RABBITMQ_USER"), os.environ.get("RABBITMQ_PASSWORD")),
-        )
-    )
-    channel = connection.channel()
-    channel.basic_consume(queue=os.environ.get("RABBITMQ_QUEUE"), on_message_callback=process_message, auto_ack=True)
-    channel.start_consuming()
+def timestamp_now() -> str:
+    from datetime import datetime
+    return datetime.utcnow().isoformat() + "Z"
 
+def get_agent() -> Dict[str, Any]:
+    return {
+        "id": "https://example.org/agent/annotation-service",
+        "name": "Annotation Service",
+        "type": "SoftwareAgent",
+    }
 
-def process_message(channel: BlockingChannel, method: Method, properties: Properties, body: bytes) -> None:
-    """
-    Callback function to process the message from RabbitMQ. This method will be called for each message received.
-    We publish this annotation through the channel on a RabbitMQ exchange.
-    :param channel: The RabbitMQ channel, which we will use to publish the resulting annotation
-    :param method: The method used to send the message, not currently used
-    :param properties: Properties of the message, not currently used
-    :param body: The message body in bytes
-    :return:
-    """
-    json_value = json.loads(body.decode("utf-8"))
-    logging.info(f"Received message: {str(json_value)}")
+def build_wlmo_fragment_selector(annotation: Dict[str, Any]) -> Dict[str, Any]:
+    box = annotation.get("boundingBox", {})
+    x = int(box.get("x", 0))
+    y = int(box.get("y", 0))
+    w = int(box.get("width", 0))
+    h = int(box.get("height", 0))
+
+    return {
+        "@type": "wlmo:FragmentSelector",
+        "wlmo:value": f"xywh={x},{y},{w},{h}",
+        "wlmo:conformsTo": "http://www.w3.org/TR/media-frags/"
+    }
+
+def run_wildlive_detection(image_uri: str) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Call WildLive detection API and return detections and image dimensions."""
+    payload = {"image_url": image_uri}
     try:
-        shared.mark_job_as_running(job_id=json_value.get("jobId"))
-        digital_object = json_value.get("object")
-        additional_info_annotations, image_height, image_width = run_jaquar_detection(
-            digital_object.get("ac:accessURI")
+        response = requests.post(
+            "https://wildlive.senckenberg.de/run_jaquar_detection",
+            json=payload,
+            timeout=15
         )
-        annotations = map_result_to_annotation(digital_object, additional_info_annotations, image_height, image_width)
-        annotation_event = map_to_annotation_event(annotations, json_value["jobId"])
-
-        logging.info(f"Publishing annotation event: {json.dumps(annotation_event)}")
-        publish_annotation_event(annotation_event, channel)
-
+        response.raise_for_status()
+        result = response.json()
+        return (
+            result.get("output", []),
+            result.get("image_height", -1),
+            result.get("image_width", -1)
+        )
     except Exception as e:
-        logging.error(f"Failed to publish annotation event: {e}")
-        send_failed_message(json_value["jobId"], str(e), channel)
+        logging.error(f"Detection failed: {e}")
+        raise
 
-
-def map_to_annotation_event(annotations: List[Dict], job_id: str) -> Dict:
-    return {"annotations": annotations, "jobId": job_id}
-
-
-def publish_annotation_event(annotation_event: Dict, channel: BlockingChannel) -> None:
-    """
-    Send the annotation to the Kafka topic
-    :param annotation_event: The formatted annotation event
-    :param channel: A RabbitMQ BlockingChannel to which we will publish the annotation
-    :return: Will not return anything
-    """
-    logging.info("Publishing annotation: " + str(annotation_event))
-    channel.basic_publish(
-        exchange=os.environ.get("RABBITMQ_EXCHANGE", "mas-annotation-exchange"),
-        routing_key=os.environ.get("RABBITMQ_ROUTING_KEY", "mas-annotation"),
-        body=json.dumps(annotation_event).encode("utf-8"),
-    )
-
-
-def map_result_to_annotation(
-    digital_object: Dict,
-    additional_info_annotations: List[Dict[str, Any]],
+def map_result_to_wlmo_annotation(
+    digital_object: Dict[str, Any],
+    organ_detections: List[Dict[str, Any]],
     image_height: int,
-    image_width: int,
-):
-    """
-    Given a target object, computes a result and maps the result to an openDS annotation.
-    :param digital_object: the target object of the annotation
-    :return: List of annotations
-    """
-    timestamp = shared.timestamp_now()
-    ods_agent = shared.get_agent()
-    annotations = list()
+    image_width: int
+) -> List[Dict[str, Any]]:
+    """Map detection results to WLMO annotations."""
+    timestamp = timestamp_now()
+    agent = get_agent()
+    annotations = []
 
-    for annotation in additional_info_annotations:
-        oa_value = {
-            "boundingBox": annotation.get("boundingBox"),
-            "class": annotation.get("class"),
-            "score": annotation.get("score")
+    for det in organ_detections:
+        selector = build_wlmo_fragment_selector(det)
+
+        body = {
+            "@type": "wlmo:TextualBody",
+            "wlmo:vernacularName": det.get("class"),
+            "wlmo:confidenceScore": det.get("score")
         }
-        oa_selector = shared.build_fragment_selector(annotation, image_width, image_height)
-        annotation = shared.map_to_annotation(
-            ods_agent,
-            timestamp,
-            oa_value,
-            oa_selector,
-            digital_object[shared.ODS_ID],
-            digital_object[shared.ODS_TYPE],
-            "https://github.com/RajapreethiRajendran/Wildlive_MAS_Template",
-        )
+
+        annotation = {
+            "@context": {
+                "wlmo": "https://w3id.org/wlmo#"
+            },
+            "@type": "wlmo:Annotation",
+            "wlmo:creator": agent,
+            "wlmo:created": timestamp,
+            "wlmo:motivation": "classifying",
+            "wlmo:target": {
+                "@type": "wlmo:DigitalObject",
+                "wlmo:id": digital_object.get("id"),
+                "wlmo:hasSelector": selector
+            },
+            "wlmo:hasBody": body,
+            "wlmo:generator": {
+                "@id": "https://wildlive.senckenberg.de/wlmo/current/",
+                "@type": "wlmo:Software",
+                "wlmo:name": "WildLive Detection Service"
+            }
+        }
+
         annotations.append(annotation)
 
     return annotations
 
+def mark_job_as_running(job_id: str) -> None:
+    logging.info(f"Marking job {job_id} as running")
 
-def run_jaquar_detection(
-    image_uri: str,
-) -> Tuple[List[Dict[str, Any]], int, int]:
-    """
-    post the image url request to plant organ segmentation service.
-    :param image_uri: The image url from which we will gather metadata
-    :return: Returns a list of additional info about the image
-    """
-    payload = {"image_url": image_uri}
-    annotations_list = []
-    auth_info = {
-        "username": os.environ.get("PLANT_ORGAN_SEGMENTATION_USER"),
-        "password": os.environ.get("PLANT_ORGAN_SEGMENTATION_PASSWORD"),
-    }
-    response = requests.post(
-        "https://webapp.senckenberg.de/dissco-mas-prototype/run_jaquar_detection",
-        auth=(auth_info["username"], auth_info["password"]),
-        json=payload,
-        timeout=10,
-    )
-    response.raise_for_status()
-    response_json = response.json()
-    if len(response_json) == 0:
-        logging.info("No results for this herbarium sheet: " + payload["image_url"])
-        return [], -1, -1
-    else:
-        for response in response_json.get("output", []):
-            annotations_list.append(
-                {
-                    "boundingBox": response.get("boundingBox"),
-                    "class": response.get("class"),
-                    "score": response.get("score")
-                }
-            )
-        image_height = response_json.get("image_height")
-        image_width = response_json.get("image_width")
-        return annotations_list, image_height, image_width
+def send_failed_message(job_id: str, message: str) -> None:
+    logging.error(f"Job {job_id} failed: {message}")
+    # TODO: Add actual failure notification (e.g. messaging queue, API callback)
 
+def publish_annotation_event(event: Dict[str, Any]) -> None:
+    logging.info(f"Publishing annotation event:\n{json.dumps(event, indent=2)}")
+    # TODO: Replace with actual event publishing (e.g. message queue, database, etc.)
 
-def send_failed_message(job_id: str, message: str, channel: BlockingChannel) -> None:
-    """
-    Sends a failure message to the mas failure topic, mas-annotation-failed
-    :param job_id: The id of the job
-    :param message: The exception message
-    :param channel: The RabbitMQ channel, which we will use to publish the failed message
-    """
+@celery.task(name="process_annotation_job")
+def process_annotation_job(job_data: Dict[str, Any]):
+    try:
+        logging.info(f"Processing job: {json.dumps(job_data)}")
+        mark_job_as_running(job_data.get("jobId"))
 
-    mas_failed = {"jobId": job_id, "errorMessage": message}
-    channel.basic_publish(
-        exchange=os.environ.get("RABBITMQ_EXCHANGE", "mas-annotation-failed-exchange"),
-        routing_key=os.environ.get("RABBITMQ_ROUTING_KEY", "mas-annotation-failed"),
-        body=json.dumps(mas_failed).encode("utf-8"),
-    )
+        digital_object = job_data["object"]
+        access_uri = digital_object.get("ac:accessURI")
 
+        detections, height, width = run_wildlive_detection(access_uri)
+        annotations = map_result_to_wlmo_annotation(digital_object, detections, height, width)
 
-def run_local(example: str) -> None:
-    """
-    Run the script locally. Can be called by replacing the kafka call with this  a method call in the main method.
-    Will call the DiSSCo API to retrieve the specimen data.
-    A record ID will be created but can only be used for testing.
-    :param example: The full URL of the Digital Specimen to the API (for example
-    https://dev.dissco.tech/api/v1/digital-media/TEST/GG9-1WB-N90
-    :return: Return nothing but will log the result
-    """
-    response = requests.get(example)
-    json_value = json.loads(response.content).get("data")
-    digital_object = json_value.get("attributes")
-    additional_info_annotations, image_height, image_width = run_plant_organ_segmentation(
-        digital_object.get("ac:accessURI")
-    )
-    annotations = map_result_to_annotation(digital_object, additional_info_annotations, image_height, image_width)
+        event = {"annotations": annotations, "jobId": job_data["jobId"]}
+        publish_annotation_event(event)
 
-    event = map_to_annotation_event(annotations, str(uuid.uuid4()))
-    logging.info("Created annotations: " + json.dumps(event))
-
+    except Exception as e:
+        logging.exception("Error during annotation processing")
+        send_failed_message(job_data.get("jobId", "unknown"), str(e))
 
 if __name__ == "__main__":
-    run_rabbitmq()
-    # run_local("https://sandbox.dissco.tech/api/digital-media/v1/SANDBOX/TC9-7ER-QVP")
+    # Example test run
+    test_input = {
+        "jobId": str(uuid.uuid4()),
+        "object": {
+            "id": "urn:example:1234",
+            "type": "DigitalMediaObject",
+            "ac:accessURI": "https://example.org/test-image.jpg"
+        }
+    }
+    process_annotation_job(test_input)
