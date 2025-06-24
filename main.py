@@ -145,11 +145,7 @@ def run_jaquar_detection(
                 {
                     "boundingBox": response.get("boundingBox"),
                     "class": response.get("class"),
-                    "score": response.get("score"),
-                    "areaInPixel": response.get("areaInPixel"),
-                    "one_cm_in_pixel": response.get("one_cm_in_pixel"),
-                    "areaInCm2": response.get("areaInCm2"),
-                    "polygon": response.get("polygon"),
+                    "score": response.get("score")
                 }
             )
         image_height = response_json.get("image_height")
