@@ -107,7 +107,7 @@ def map_result_to_annotation(
             oa_selector,
             digital_object[shared.ODS_ID],
             digital_object[shared.ODS_TYPE],
-            "https://github.com/RajapreethiRajendran/demo-enrichment-service-image",
+            "https://github.com/RajapreethiRajendran/Wildlive_MAS_Template",
         )
         annotations.append(annotation)
 
