@@ -1,0 +1,6 @@
+celery[py-amqp]==5.3.6
+requests==2.31.0         
+rdflib==7.0.0             
+pyld==2.0.3               
+python-dotenv==1.0.1      
+loguru==0.7.2              
