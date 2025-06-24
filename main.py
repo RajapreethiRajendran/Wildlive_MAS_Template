@@ -97,11 +97,7 @@ def map_result_to_annotation(
         oa_value = {
             "boundingBox": annotation.get("boundingBox"),
             "class": annotation.get("class"),
-            "score": annotation.get("score"),
-            "areaInPixel": annotation.get("areaInPixel"),
-            "one_cm_in_pixel": annotation.get("one_cm_in_pixel"),
-            "areaInCm2": annotation.get("areaInCm2"),
-            "polygon": annotation.get("polygon"),
+            "score": annotation.get("score")
         }
         oa_selector = shared.build_fragment_selector(annotation, image_width, image_height)
         annotation = shared.map_to_annotation(
